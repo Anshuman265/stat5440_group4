@@ -1,0 +1,839 @@
+---
+title: "Missing and Censored Data Tutorial"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# 1. Missing Data
+
+# 2. Censored Data
+
+## 2.1 Definition
+Censored data occurs when an observation is only partially known. Specifically, the true value is known to lie within an interval $(a, b)$, but the exact value is not observed.
+
+- **Right censoring** occurs when the true value is known to be greater than a threshold $(a, +\infty)$.  
+  - For example, in a 12-month study tracking laptop battery life, any battery that lasts beyond the study period is right-censored because the exact battery life is unknown, we only know the battery life is longer than the duration of study.
+
+- **Left censoring** occurs when the true value is known to be less than a threshold $(-\infty, b)$.  
+  - For example, in water quality testing, pollutant levels below a detection limit are left-censored because the exact reading is unknown, we only know the pollutant level is below the detection limit.
+
+- **Interval censoring** occurs when the true value is only known to lie within a range $(a, b)$.  
+  - For example, a dentist may only know that a cavity developed between two visits without the exact date.
+
+**Note:** The symbols $-\infty$ and $+\infty$ are used for notational convenience. In real applications, the effective bounds are determined by the specific problem and may be finite rather than truly infinite, which is equivalent to interval-censored data.
+
+## 2.2 Censored v.s Truncated Data
+**Censoring** occurs when observations lie in certain intervals instead of being exact values, which are partially observed.
+
+- We know the censoring threshold and how many observations are censored
+- However, we do not know the exact values of those observations
+
+**Truncation** occurs when observations within certain intervals are completely excluded, which are completely unobservable.
+
+- Sometimes we know the threshold used to truncate data, but such information is not known most of the time
+- However, we do not know how many observations are removed or what their exact values are
+
+**Note:** When both truncation threshold and number of truncated observations are known, the problem becomes very similar to censoring. If either piece of information is missing, incorporating the truncation mechanism into a Bayesian model becomes challenging without additional assumptions.
+
+## 2.3 Motivation
+### What problem does our methods solve?
+Methods for censored data allow us to make valid statistical inferences even when some outcomes are only partially observed. Instead of treating censored values as exact, these methods account for the uncertainty by incorporating the known constraints into the model.
+
+### Why can’t standard regression handle censored data?
+Standard regression assumes that all response values are observed exactly.
+
+- Treating censored values as fixed numbers leads to biased parameter estimates.  
+- It also results in an incorrect likelihood function because it ignores the uncertainty in censored observations.
+
+### Where does censored data arise in practice?
+Censored data commonly arises in situations where the exact value of a variable cannot be fully observed due to practical limitations. Instead, only partial information about the value is available.
+
+Some common settings include:
+
+- **Survival analysis and time-to-event studies**  
+  In many studies, the event of interest (e.g., death, failure, or recovery) may not occur within the observation period. As a result, we only know that the event time exceeds a certain duration.
+
+- **Measurement limits in scientific instruments**  
+  Instruments often have detection limits, meaning values below or above a certain threshold cannot be precisely measured. In such cases, observations are recorded as being below or above that limit.
+
+- **Economic and survey data**  
+  Income, expenditure, or other sensitive variables may be top-coded or bottom-coded (e.g., “above $100,000”), leading to censored observations.
+
+## 2.4 Solutions
+### 2.4.1 Assumptions and Setups
+To model censored data, we typically assume:  
+
+- Both observed and censored values come from the same underlying distribution  
+- Specifically, for the simplicity of demonstrating the solutions, we assume partially observed data are right-censored and true values $$y_i \sim \mathcal{N}(\mu_i, \sigma^2), \quad \mu_i = \beta_0 + \beta_1 x_i$$
+
+We also define an indicator variable to distinguish between observed and censored data for modeling purpose:
+
+- $\delta_i = 1$ if the observation is fully observed.  
+- $\delta_i = 0$ if the observation is censored.  
+
+### 2.4.2 Marginalization
+**Core Idea**: You never explicitly model the censored data. Instead, you account for them by using the
+probability that the true value exceeds the censoring threshold
+
+- It does not require sampling latent variables.  
+- Censored values are integrated out of the likelihood function.  
+- The method relies on cumulative distribution function (CDF) terms.  
+
+**Likelihood Specification**
+
+- If $\delta_i = 1$, the likelihood contribution is the standard density:
+  $$
+  p(y_i \mid \beta_0, \beta_1, \sigma)
+  $$
+
+- If $\delta_i = 0$, the likelihood contribution reflects the probability of exceeding the threshold:
+  $$
+  P(y_i > c \mid \beta_0, \beta_1, \sigma)
+  $$
+
+**CDF-Based Expressions**
+
+The likelihood contributions for censored observations can be expressed using the cumulative distribution function (CDF) $F(c \mid \beta_0, \beta_1, \sigma)$:
+
+- For right-censored data:
+  $$
+  P(y_i > c) = 1 - F(c \mid \beta_0, \beta_1, \sigma)
+  $$
+
+- For left-censored data:
+  $$
+  P(y_i < c) = F(c \mid \beta_0, \beta_1, \sigma)
+  $$
+
+- For interval-censored data:
+  $$
+  P(a < y_i < b) = F(b \mid \beta_0, \beta_1, \sigma) - F(a \mid \beta_0, \beta_1, \sigma)
+  $$
+  
+**Full Likelihood**
+
+The full likelihood combines both observed and censored contributions:
+
+$$
+L(\beta_0, \beta_1, \sigma) =
+\prod_{i:\delta_i=1} p(y_i \mid \beta_0, \beta_1, \sigma)
+\times
+\prod_{i:\delta_i=0} P(y_i > c \mid \beta_0, \beta_1, \sigma)\\ 
+=
+\prod_{i:\delta_i=1} p(y_i \mid \beta_0, \beta_1, \sigma)
+\times
+\prod_{i:\delta_i=0} (1 - F(c \mid \beta_0, \beta_1, \sigma))
+$$
+
+**Advantages**
+
+- This approach is computationally efficient because it introduces no additional parameters.  
+- It often results in faster inference and better MCMC convergence.  
+
+**Disadvantages**
+
+- It requires a closed-form expression for the CDF.  
+- It can be difficult to apply in more complex or customized models.  
+
+### 2.4.3 Data Augmentation
+**Core Idea**: Censored observations are treated as unknown (latent variables).
+
+- Each censored value is explicitly modeled as a latent variable $y_i^{mis}$.  
+- A constraint such as $y_i^{mis} > c$ is imposed. 
+- The values are sampled during MCMC procedures.
+
+The model becomes:
+
+$$
+y_i^{mis} \sim \mathcal{N}(\mu_i, \sigma^2), \quad y_i^{mis} > c
+$$
+
+where $\mu_i = \beta_0 + \beta_1 x_i$.
+
+### Likelihood
+
+The likelihood includes both observed and latent values:
+
+$$
+L(\beta_0, \beta_1, \sigma) =
+\prod_{i:\delta_i=1} p(y_i \mid \beta_0, \beta_1, \sigma)
+\times
+\prod_{i:\delta_i=0} p(y_i^{mis} \mid \beta_0, \beta_1, \sigma)
+$$
+
+**Advantages**
+
+- This method is highly flexible and works well with complex models.  
+- It does not require a closed-form CDF.  
+- It provides imputed values for censored observations.  
+
+**Disadvantages**
+
+- It is computationally slower due to the increased number of parameters.  
+- It may suffer from poor mixing in MCMC when many observations are censored. 
+
+## 2.5 R examples
+### 2.5.1 Marginalization Example in R
+
+```{r}
+# =============================================================================
+# STAT 5440 — Applied Bayesian Modeling (Spring 2026)
+# Group 4 Final Project: Missing & Censored Data
+# =============================================================================
+# FILE:    censored_data_analysis.R
+# PURPOSE: Bayesian survival analysis on the NCCTG lung cancer dataset using
+#          Weibull and log-normal AFT models with right-censored outcomes.
+#          Covers: model fitting, MCMC diagnostics, posterior summaries,
+#          posterior predictive checks, and sensitivity to parametric family.
+# DATA:    survival::lung — 228 patients with advanced lung cancer
+#          Variables used: time (days), status (1=censored, 2=died), age, sex
+# OUTPUT:  Console summaries for slides 43–46
+#          traceplots.png, rhat.png, neff.png, ppc.png — figures for slides
+# =============================================================================
+
+# -- Dependencies --------------------------------------------------------------
+library(brms)       # Bayesian regression via Stan; handles censored likelihoods
+library(survival)   # Provides the lung dataset
+library(posterior)  # Posterior draw manipulation (as_draws_df, as_draws_array)
+library(bayesplot)  # MCMC diagnostic and PPC plots
+library(ggplot2)    # Plot saving via ggsave
+library(dplyr)      # Data manipulation
+library(tidyr)      # Data reshaping
+
+# -- Data Preparation ----------------------------------------------------------
+
+data("lung")
+
+# Drop the 3 rows with missing age or sex — these are not censored,
+# they are genuinely unrecorded and excluded per the analysis plan.
+lung <- lung[complete.cases(lung[, c("time", "status", "age", "sex")]), ]
+
+# Recode the censoring indicator for brms:
+#   status == 1 → patient was alive at study end (right-censored)
+#   status == 2 → patient died (observed event)
+# brms cens() expects the strings "right" and "none".
+lung$censored <- ifelse(lung$status == 1, "right", "none")
+
+# Convert sex to a factor so brms creates the correct dummy variable.
+# Level 1 = male (reference), Level 2 = female.
+# The coefficient b_sex2 will represent the female vs. male log-time difference.
+lung$sex <- factor(lung$sex)
+
+# -- Model 1: Weibull AFT ------------------------------------------------------
+#
+# Model: log(T_i) = alpha + beta_age * age_i + beta_sex * sex_i + sigma * eps_i
+#        eps_i ~ Gumbel  =>  T_i ~ Weibull(shape, scale)
+#
+# The cens(censored) wrapper applies the correct likelihood contributions:
+#   - Observed deaths:   full Weibull density f(t_i | theta)
+#   - Censored patients: survival function S(c_i | theta) = P(T > c_i)
+#
+# Priors (on the log-time scale):
+#   Intercept ~ N(log(365), 1)   — baseline median near 1 year
+#   beta_age, beta_sex ~ N(0, 0.5^2) — weak shrinkage, direction-agnostic
+#   shape ~ Gamma(2, 2)          — weakly informative, keeps shape > 0
+
+fit_weibull <- brm(
+  formula = time | cens(censored) ~ age + sex,
+  family  = weibull(),
+  data    = lung,
+  prior   = c(
+    prior(normal(5.9, 1),  class = "Intercept"),
+    prior(normal(0, 0.5),  class = "b"),
+    prior(gamma(2, 2),     class = "shape")
+  ),
+  chains  = 4,       # 4 independent chains for convergence assessment
+  iter    = 2000,    # 2000 total iterations per chain
+  warmup  = 1000,    # First 1000 discarded (adaptation/warmup phase)
+  seed    = 5440,    # Reproducibility seed
+  refresh = 500      # Print progress every 500 iterations
+)
+
+# -- Model 2: Log-normal AFT ---------------------------------------------------
+#
+# Identical formula and priors as Model 1, but the error distribution
+# is normal on the log scale rather than Gumbel.
+# This gives a non-monotone hazard (hazard peaks then decreases),
+# which better captures long-term survivors.
+# Used exclusively for the sensitivity analysis on slide 46.
+#
+# Note: log-normal has no shape parameter, so the Gamma prior is omitted.
+
+fit_lognormal <- brm(
+  formula = time | cens(censored) ~ age + sex,
+  family  = lognormal(),
+  data    = lung,
+  prior   = c(
+    prior(normal(5.9, 1),  class = "Intercept"),
+    prior(normal(0, 0.5),  class = "b")
+  ),
+  chains  = 4,
+  iter    = 2000,
+  warmup  = 1000,
+  seed    = 5440,
+  refresh = 500
+)
+```
+
+**Marginalization Fit and Diagnostics**
+```{r}
+# -- MCMC Diagnostics ----------------------------------------------------------
+#
+# Three standard convergence checks for the Weibull model:
+#   R-hat:      potential scale reduction factor; < 1.01 indicates convergence
+#   Neff ratio: effective draws / total draws; > 0.1 is acceptable, > 0.4 is good
+#   Divergences: non-zero count signals problematic posterior geometry
+
+cat("\n===== DIAGNOSTICS: WEIBULL =====\n")
+
+# Use brms:: explicitly to avoid namespace conflict with bayesplot::rhat
+rhats <- brms::rhat(fit_weibull)
+cat("Max Rhat:", round(max(rhats, na.rm = TRUE), 4), "\n")
+cat("Any Rhat > 1.01:", any(rhats > 1.01, na.rm = TRUE), "\n")
+
+neffs <- brms::neff_ratio(fit_weibull)
+cat("Min Neff ratio:", round(min(neffs, na.rm = TRUE), 3), "\n")
+
+np <- nuts_params(fit_weibull)
+cat("Divergences:", sum(np$Value[np$Parameter == "divergent__"]), "\n")
+```
+
+**Marginalization Posterior Summaries**
+```{r}
+# -- Posterior Summaries -------------------------------------------------------
+#
+# Extracts the full brms posterior summary (mean, SD, 95% CrI, R-hat, ESS)
+# and then computes posterior median survival times for males and females
+# at the sample mean age.
+#
+# Median survival formula for Weibull AFT:
+#   median(T) = scale * (log 2)^(1/shape)
+#   where scale = exp(alpha + beta_age * age + beta_sex * sex)
+# This transforms the log-time regression back to the original days scale.
+
+cat("\n===== POSTERIOR SUMMARY: WEIBULL =====\n")
+print(summary(fit_weibull))
+
+# Compute at the sample mean age for a representative comparison
+mean_age <- mean(lung$age)
+
+# Extract all 4000 post-warmup draws as a data frame
+draws_w <- as_draws_df(fit_weibull)
+
+# Posterior draws of median survival: male (sex = 1, reference level)
+med_male_w <- exp(
+  draws_w$b_Intercept +
+  draws_w$b_age * mean_age
+) * (log(2))^(1 / draws_w$shape)
+
+# Posterior draws of median survival: female (sex = 2, adds b_sex2)
+med_female_w <- exp(
+  draws_w$b_Intercept +
+  draws_w$b_age * mean_age +
+  draws_w$b_sex2
+) * (log(2))^(1 / draws_w$shape)
+
+cat("\nMedian survival MALE   (Weibull):", round(median(med_male_w), 1),
+    " 95% CrI:", round(quantile(med_male_w, 0.025), 1),
+    "-", round(quantile(med_male_w, 0.975), 1), "\n")
+
+cat("Median survival FEMALE (Weibull):", round(median(med_female_w), 1),
+    " 95% CrI:", round(quantile(med_female_w, 0.025), 1),
+    "-", round(quantile(med_female_w, 0.975), 1), "\n")
+```
+
+**Marginalization Posterior Predictive Check**
+```{r}
+# -- Posterior Predictive Check — Fraction Censored ----------------------------
+#
+# Standard PPC is complicated by censoring: for censored patients, the observed
+# value is only a lower bound on the true event time, so we cannot compare
+# y_rep directly to y for those rows.
+#
+# Procedure:
+#   1. Draw 4000 replicated survival times from the posterior predictive.
+#   2. Apply the same administrative censoring rule: if a simulated survival
+#      time exceeds the patient's actual follow-up window, it would have been
+#      censored in the real study too.
+#   3. Compare the fraction censored in simulated data vs. observed 27.6%.
+#
+# A well-calibrated model should produce a simulated censoring fraction
+# whose 95% interval contains the observed fraction.
+
+cat("\n===== PPC: FRACTION CENSORED =====\n")
+
+# posterior_predict returns a matrix: rows = posterior draws, cols = patients
+pp <- posterior_predict(fit_weibull)
+
+# Each patient's follow-up time serves as their censoring threshold
+followup <- lung$time
+
+obs_cens_frac <- mean(lung$censored == "right")
+cat("Observed fraction censored:", round(obs_cens_frac, 3), "\n")
+
+# For each posterior draw, count how many simulated times exceed follow-up
+sim_cens_frac <- apply(pp, 1, function(yrep) mean(yrep > followup))
+cat("Posterior 95% interval for fraction censored:",
+    round(quantile(sim_cens_frac, 0.025), 3), "-",
+    round(quantile(sim_cens_frac, 0.975), 3), "\n")
+```
+
+**Marginalization Sensitivity Analysis**
+```{r}
+# -- Sensitivity Analysis: Log-normal vs Weibull -------------------------------
+#
+# The parametric family is an untestable modeling assumption — both Weibull
+# and log-normal fit the observed data, but they make different extrapolations.
+# We compare median survival and b_sex across both families.
+# If the key conclusion (female sex -> longer survival, CrI excludes 0)
+# holds under both, the result is robust to this modeling choice.
+#
+# Log-normal median formula:
+#   median(T) = exp(mu)   where mu = alpha + beta_age * age + beta_sex * sex
+# (No shape parameter needed — the median of a log-normal is just exp of the mean)
+
+cat("\n===== POSTERIOR SUMMARY: LOG-NORMAL =====\n")
+print(summary(fit_lognormal))
+
+draws_ln <- as_draws_df(fit_lognormal)
+
+med_male_ln <- exp(
+  draws_ln$b_Intercept +
+  draws_ln$b_age * mean_age
+)
+
+med_female_ln <- exp(
+  draws_ln$b_Intercept +
+  draws_ln$b_age * mean_age +
+  draws_ln$b_sex2
+)
+
+cat("\nMedian survival MALE   (Log-normal):", round(median(med_male_ln), 1),
+    " 95% CrI:", round(quantile(med_male_ln, 0.025), 1),
+    "-", round(quantile(med_male_ln, 0.975), 1), "\n")
+
+cat("Median survival FEMALE (Log-normal):", round(median(med_female_ln), 1),
+    " 95% CrI:", round(quantile(med_female_ln, 0.025), 1),
+    "-", round(quantile(med_female_ln, 0.975), 1), "\n")
+
+# Side-by-side b_sex comparison across both families
+cat("\nbeta_sex Weibull  — Mean:", round(mean(draws_w$b_sex2), 3),
+    " 95% CrI:", round(quantile(draws_w$b_sex2, 0.025), 3),
+    "-", round(quantile(draws_w$b_sex2, 0.975), 3), "\n")
+
+cat("beta_sex Log-norm — Mean:", round(mean(draws_ln$b_sex2), 3),
+    " 95% CrI:", round(quantile(draws_ln$b_sex2, 0.025), 3),
+    "-", round(quantile(draws_ln$b_sex2, 0.975), 3), "\n")
+```
+
+**Marginalization Diagnostic & PPC Figures**
+```{r}
+# -- Diagnostic & PPC Figures --------------------------------------------------
+#
+# Generates four PNG files for use in the LaTeX presentation.
+# All files are saved to the working directory.
+#
+#   traceplots.png  → Slide 43: visual convergence check for key parameters
+#   rhat.png        → Slide 43: dot plot of all R-hat values
+#   neff.png        → Slide 43: dot plot of all Neff ratios
+#   ppc.png         → Slide 45: posterior predictive density overlay
+
+# 1. Trace plots — four chains should overlap like a fuzzy caterpillar
+p_trace <- mcmc_trace(
+  as_draws_array(fit_weibull),
+  pars = c("b_Intercept", "b_age", "b_sex2", "shape")
+) + ggtitle("Trace Plots — Weibull Model")
+
+ggsave("traceplots.png", p_trace, width = 10, height = 6, dpi = 150)
+
+# 2. R-hat plot — all values should cluster tightly below 1.01
+p_rhat <- mcmc_rhat(brms::rhat(fit_weibull)) +
+  ggtitle("R-hat Values — Weibull Model")
+
+ggsave("rhat.png", p_rhat, width = 6, height = 4, dpi = 150)
+
+# 3. Effective sample size ratio plot — values above 0.1 are acceptable
+p_neff <- mcmc_neff(brms::neff_ratio(fit_weibull)) +
+  ggtitle("Effective Sample Size Ratios — Weibull Model")
+
+ggsave("neff.png", p_neff, width = 6, height = 4, dpi = 150)
+
+# 4. PPC density overlay — simulated densities (light blue) should
+#    closely match the observed density (dark line) in the bulk of the
+#    distribution; divergence in the right tail reflects Weibull's
+#    known underprediction of long survivors
+p_ppc <- pp_check(fit_weibull, ndraws = 50) +
+  ggtitle("Posterior Predictive Check — Weibull")
+
+ggsave("ppc.png", p_ppc, width = 7, height = 4, dpi = 150)
+
+cat("\nAll figures saved to working directory.\n")
+cat("Files: traceplots.png, rhat.png, neff.png, ppc.png\n")
+```
+
+### 2.5.2 Data Augmentation Example in R
+
+```{r}
+# =============================================================================
+# STAT 5440 — Applied Bayesian Modeling (Spring 2026)
+# Group 4 Final Project: Missing & Censored Data
+# =============================================================================
+# FILE:    censored_data_augmentation.R
+# PURPOSE: Demonstrates data augmentation for censored survival data using
+#          Stan directly. Latent event times for censored patients are treated
+#          as parameters and sampled with a truncation constraint T[lower,].
+#          Results are compared against the marginalization approach (brms)
+#          to show both methods converge to the same posterior.
+# DATA:    survival::lung — 228 patients with advanced lung cancer
+# OUTPUT:  Console comparison of both approaches
+#          augmentation_traceplots.png  — trace plots for key parameters
+#          augmentation_latent.png      — posterior draws of imputed event times
+#          method_comparison.png        — beta_sex posterior: augmentation vs marginalization
+# =============================================================================
+
+# -- Dependencies --------------------------------------------------------------
+library(rstan)      # Direct Stan interface
+
+# Stan options — use all available cores, cache compiled model
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# -- Data Preparation ----------------------------------------------------------
+# Recode sex: 1 = male (reference), 2 = female
+# We store sex as a 0/1 numeric for Stan (0 = male, 1 = female)
+lung$sex_num  <- as.numeric(lung$sex == 2)
+
+# Split into observed (died) and censored (still alive at study end)
+idx_obs  <- which(lung$status == 2)   # observed event times
+idx_cens <- which(lung$status == 1)   # censoring times (lower bounds only)
+
+cat("Total patients:", nrow(lung), "\n")
+cat("Observed deaths:", length(idx_obs), "\n")
+cat("Censored (alive at study end):", length(idx_cens),
+    paste0("(", round(100 * length(idx_cens) / nrow(lung), 1), "%)"), "\n\n")
+
+# -- Stan Data List ------------------------------------------------------------
+#
+# Stan needs the observed and censored patients passed separately because they
+# contribute different terms to the likelihood:
+#   - Observed:  full Weibull density f(t_i | theta)
+#   - Censored:  latent t_cens[i] ~ Weibull T[c_i, ] (truncated below by c_i)
+
+# -- Stan Data List ------------------------------------------------------------
+# Center age so the intercept is interpretable at mean age
+# and initialization is numerically stable
+mean_age <- mean(lung$age)
+age_centered_obs  <- lung$age[idx_obs]  - mean_age
+age_centered_cens <- lung$age[idx_cens] - mean_age
+
+stan_data <- list(
+  N_obs        = length(idx_obs),
+  N_cens       = length(idx_cens),
+  t_obs        = lung$time[idx_obs],
+  t_cens_lower = lung$time[idx_cens],
+  X_obs        = cbind(age_centered_obs,  lung$sex_num[idx_obs]),
+  X_cens       = cbind(age_centered_cens, lung$sex_num[idx_cens])
+)
+
+# -- Stan Model Code -----------------------------------------------------------
+# TRUE data augmentation: t_cens declared in parameters block,
+# sampled with T[lower,] truncation enforcing t_cens[i] > c_i
+stan_code <- "
+data {
+  int<lower=0> N_obs;
+  int<lower=0> N_cens;
+  vector<lower=0>[N_obs]  t_obs;
+  vector<lower=0>[N_cens] t_cens_lower;
+  matrix[N_obs,  2] X_obs;
+  matrix[N_cens, 2] X_cens;
+}
+parameters {
+  real          alpha;
+  vector[2]     beta;
+  real<lower=0> shape;
+  
+  // FIX 1: Strict lower bound using the censoring threshold
+  vector<lower=t_cens_lower>[N_cens] t_cens; 
+}
+model {
+  alpha ~ normal(5.9, 1);
+  beta  ~ normal(0, 0.5);
+  shape ~ gamma(2, 2);
+
+  // Observed patients: full Weibull density
+  t_obs ~ weibull(shape, exp(alpha + X_obs * beta));
+
+  // Censored patients: Evaluate the base density! 
+  // FIX 2: No T[...] truncation needed. The bounds in the parameters 
+  // block handle the domain restriction natively.
+  for (i in 1:N_cens) {
+    t_cens[i] ~ weibull(shape, exp(alpha + X_cens[i] * beta));
+  }
+}
+generated quantities {
+  real med_male   = exp(alpha)           * pow(log(2), 1.0 / shape);
+  real med_female = exp(alpha + beta[2]) * pow(log(2), 1.0 / shape);
+}
+"
+
+# -- Initial values ------------------------------------------------------------
+# t_cens initialized at 2x the censoring threshold — safely above T[lower,]
+init_fn <- function() {
+  list(
+    alpha  = 5.9,
+    beta   = c(0.0, 0.0),
+    shape  = 1.2,
+    t_cens = stan_data$t_cens_lower * 2.0
+  )
+}
+
+# -- Fit -----------------------------------------------------------------------
+fit_augmentation <- stan(
+  model_code = stan_code,
+  data       = stan_data,
+  chains     = 4,
+  iter       = 2000,
+  warmup     = 1000,
+  seed       = 5440,
+  refresh    = 500,
+  init       = init_fn
+)
+```
+
+**Data Augmentation Fit and Diagnostics**
+```{r}
+# -- Diagnostics ---------------------------------------------------------------
+
+cat("\n===== DIAGNOSTICS: DATA AUGMENTATION =====\n")
+
+# Extract diagnostics — focus on the structural parameters, not the 63 latent times
+params_of_interest <- c("alpha", "beta[1]", "beta[2]", "shape",
+                        "med_male", "med_female")
+
+print(fit_augmentation, pars = params_of_interest,
+      probs = c(0.025, 0.5, 0.975))
+
+# Check R-hat and divergences
+sampler_params <- get_sampler_params(fit_augmentation, inc_warmup = FALSE)
+divergences    <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+cat("\nTotal divergences:", divergences, "\n")
+
+rhats_aug <- summary(fit_augmentation)$summary[params_of_interest, "Rhat"]
+cat("Max Rhat (structural params):", round(max(rhats_aug, na.rm = TRUE), 4), "\n")
+```
+
+**Data Augmentation Trace Plots**
+```{r}
+# -- Trace Plots ---------------------------------------------------------------
+#
+# Trace plots for the four structural parameters.
+# We deliberately exclude the 63 latent t_cens parameters from the trace plot
+# — they are high-dimensional and their mixing is harder to assess visually,
+# but convergence of alpha, beta, shape implies the latent times are also mixing.
+
+draws_array <- as.array(fit_augmentation,
+                        pars = c("alpha", "beta[1]", "beta[2]", "shape"))
+
+p_trace_aug <- mcmc_trace(draws_array) +
+  ggtitle("Trace Plots — Weibull Data Augmentation",
+          subtitle = "4 chains, 1000 post-warmup draws each") +
+  theme_minimal()
+
+ggsave("augmentation_traceplots.png", p_trace_aug,
+       width = 10, height = 6, dpi = 150)
+cat("\nSaved: augmentation_traceplots.png\n")
+```
+
+**Data Augmentation Posterior of Imputed Event Times**
+```{r}
+# -- Posterior of Imputed Event Times ------------------------------------------
+#
+# This plot is unique to data augmentation — marginalization never produces
+# posterior draws of the censored patients' event times.
+# We show the posterior median and 95% CrI for each of the 63 latent times,
+# ordered by their censoring threshold c_i.
+
+draws_df  <- as.data.frame(fit_augmentation)
+cens_cols <- grep("^t_cens\\[", names(draws_df), value = TRUE)
+
+latent_summary <- data.frame(
+  patient_id    = seq_along(idx_cens),
+  cens_lower    = stan_data$t_cens_lower,
+  post_median   = sapply(cens_cols, function(col) median(draws_df[[col]])),
+  post_lower    = sapply(cens_cols, function(col) quantile(draws_df[[col]], 0.025)),
+  post_upper    = sapply(cens_cols, function(col) quantile(draws_df[[col]], 0.975))
+) %>% arrange(cens_lower)
+
+p_latent <- ggplot(latent_summary,
+                   aes(x = reorder(patient_id, cens_lower))) +
+  geom_errorbar(aes(ymin = post_lower, ymax = post_upper),
+                color = "steelblue", alpha = 0.5, width = 0) +
+  geom_point(aes(y = post_median), color = "steelblue", size = 1) +
+  geom_point(aes(y = cens_lower), color = "tomato", size = 1, shape = 4) +
+  labs(
+    title    = "Posterior Distributions of Latent Event Times",
+    subtitle = "Blue = posterior median + 95% CrI  |  Red cross = censoring threshold c_i",
+    x        = "Censored patients (ordered by censoring time)",
+    y        = "Survival time (days)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+ggsave("augmentation_latent.png", p_latent,
+       width = 10, height = 5, dpi = 150)
+cat("Saved: augmentation_latent.png\n")
+```
+
+**Model Comparison: Augmentation vs Marginalization**
+```{r}
+# -- Method Comparison: Augmentation vs Marginalization ------------------------
+#
+# The key result: both methods should give virtually identical posteriors
+# for the structural parameters (alpha, beta, shape).
+# We compare beta[2] (the sex coefficient) across both approaches.
+#
+# NOTE: this block requires fit_weibull from censored_data_analysis.R.
+# Run that script first, or load the saved fit object if cached.
+
+if (exists("fit_weibull")) {
+  
+  draws_marg <- as_draws_df(fit_weibull)
+  beta_sex_marg <- draws_marg$b_sex2
+  
+  beta_sex_aug  <- draws_df[["beta[2]"]]
+  
+  compare_df <- data.frame(
+    beta_sex = c(beta_sex_marg, beta_sex_aug),
+    Method   = c(rep("Marginalization (brms)", length(beta_sex_marg)),
+                 rep("Data Augmentation (Stan)", length(beta_sex_aug)))
+  )
+  
+  p_compare <- ggplot(compare_df, aes(x = beta_sex, fill = Method)) +
+    geom_density(alpha = 0.5) +
+    scale_fill_manual(values = c("steelblue", "tomato")) +
+    labs(
+      title    = "Posterior of beta_sex: Augmentation vs Marginalization",
+      subtitle = "Both methods should produce identical posteriors",
+      x        = "beta_sex (female vs male, log-time scale)",
+      y        = "Density"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  ggsave("method_comparison.png", p_compare,
+         width = 8, height = 5, dpi = 150)
+  cat("Saved: method_comparison.png\n")
+  
+  # Numeric comparison
+  cat("\n===== METHOD COMPARISON: beta_sex =====\n")
+  cat("Marginalization — Mean:", round(mean(beta_sex_marg), 3),
+      " 95% CrI:", round(quantile(beta_sex_marg, 0.025), 3),
+      "-", round(quantile(beta_sex_marg, 0.975), 3), "\n")
+  cat("Augmentation   — Mean:", round(mean(beta_sex_aug), 3),
+      " 95% CrI:", round(quantile(beta_sex_aug, 0.025), 3),
+      "-", round(quantile(beta_sex_aug, 0.975), 3), "\n")
+  cat("\nIf these are close, both approaches are working correctly.\n")
+  
+} else {
+  cat("\nNote: fit_weibull not found in environment.\n")
+  cat("Run censored_data_analysis.R first to generate the comparison plot.\n")
+}
+
+cat("\n===== SUMMARY =====\n")
+cat("Data augmentation introduces", length(idx_cens),
+    "latent parameters (one per censored patient).\n")
+cat("Marginalization uses 0 latent parameters.\n")
+cat("Both methods target the same posterior for alpha, beta, shape.\n")
+cat("Only augmentation provides posterior draws for imputed event times.\n")
+```
+
+### 2.5.3 Naive Model (Ignoring Censoring) Example in R
+```{r}
+# -- Model 3: Naive Model (Ignoring Censoring) ---------------------------------
+#
+# This model treats all observed times as if they were exact event times.
+# It does NOT account for censoring, which leads to biased estimates.
+# It used the same modeling choice as before
+#
+# Conceptually:
+#   - It incorrectly assumes all patients experienced the event (death)
+#   - Censored observations are treated as if the event happened at that time
+
+fit_fixed <- brm(
+  formula = time ~ age + sex,
+  family  = weibull(),
+  data    = lung,
+  prior   = c(
+    prior(normal(5.9, 1),  class = "Intercept"),
+    prior(normal(0, 0.5),  class = "b"),
+    prior(gamma(2, 2),     class = "shape")
+  ),
+  chains  = 4,       # 4 independent chains for convergence assessment
+  iter    = 2000,    # 2000 total iterations per chain
+  warmup  = 1000,    # First 1000 discarded (adaptation/warmup phase)
+  seed    = 5440,    # Reproducibility seed
+  refresh = 500      # Print progress every 500 iterations
+)
+
+# -- Model Posterior Comparison ------------------------------------------------
+# Compare posterior coefficients mean and its 95% CrI between models 
+# Extract posterior draws for the censored (marginalization) model
+draws_marg <- as_draws_df(fit_weibull) %>%
+  transmute(
+    method = "Censoring (Marginalization)",
+    age = b_age,
+    sex = b_sex2   # Female vs Male effect
+  )
+
+# Extract posterior draws from the Stan augmentation model
+draws_aug_raw <- as.data.frame(fit_augmentation)
+draws_aug <- draws_aug_raw %>%
+  transmute(
+    method = "Censoring (Data Augmentation)",
+    age = `beta[1]`,
+    sex = `beta[2]`
+  )
+
+# Extract posterior draws for the naive model
+draws_fixed <- as_draws_df(fit_fixed) %>%
+  transmute(
+    method = "Ignore Censoring (Fixed)",
+    age = b_age,
+    sex = b_sex2
+  )
+
+# Combine and reshape data for plotting
+coef_plot_data <- bind_rows(draws_marg, draws_aug, draws_fixed) %>%
+  pivot_longer(cols = c(age, sex), names_to = "term", values_to = "value") %>%
+  group_by(method, term) %>%
+  summarise(
+    mean = mean(value),               # Posterior mean
+    lower = quantile(value, 0.025),   # 2.5% quantile (lower CrI)
+    upper = quantile(value, 0.975),   # 97.5% quantile (upper CrI)
+    .groups = "drop"
+  ) %>%
+  mutate(
+    term = recode(term,
+                  age = "Age",
+                  sex = "Sex (Female vs Male)")
+  )
+
+# Plot posterior means with 95% credible intervals
+p_coef <- ggplot(coef_plot_data,
+                 aes(x = term, y = mean, ymin = lower, ymax = upper, color = method)) +
+  geom_pointrange(position = position_dodge(width = 0.45), linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = 2, color = "gray40") +
+  labs(
+    title = "Posterior Regression Coefficients: Censoring vs Ignore Censoring",
+    x = NULL,
+    y = "Posterior Estimates with 95% CrI",
+    color = NULL
+  ) +
+  theme_bw(base_size = 12)
+
+print(p_coef)
+```
+
+The plot clearly demonstrates the importance of properly handling censored data in bayesian modeling. When censoring is appropriately accounted for, either through marginalization or data augmentation, the estimated effect of sex is substantially larger and more precise compared to the model that ignores censoring. In contrast, the naive model that treats censored observations as fully observed severely underestimates this effect. Notably, for the model that ignores censoring, the 95% credible interval for the sex effect even crosses zero, suggesting less statistically meaningful effect. This is misleading, as both censoring-aware approaches consistently indicate a positive effect. This discrepancy arises because ignoring censoring incorrectly assumes that all observed times represent complete outcomes, thereby biasing inference. Overall, the plot highlights that failing to model censoring can distort conclusions—potentially leading to incorrect inferences about significance, and underscores the necessity of using appropriate methods when analyzing censored data.
