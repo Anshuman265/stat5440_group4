@@ -1,0 +1,883 @@
+---
+title: "Understanding Missing Data: A Bayesian Approach"
+author: "Team 4"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+library(kableExtra)
+```
+
+# The Missing Data Problem
+
+## Formal Setup
+
+In any dataset, we can decompose the complete data into observed and missing parts:
+
+$$y = (y_{\text{obs}}, y_{\text{mis}})$$
+
+We also have:
+
+- **Inclusion indicator** $I$ where $I_{ij} = 1$ if observed, $0$ if missing
+- **Data parameter** $\theta$ (what we want to estimate)
+- **Missingness parameter** $\phi$ (governs the missing mechanism)
+
+The joint model factors into two pieces:
+
+$$\underbrace{p(y, I \mid \theta, \phi)}_{\text{what we model}} = \underbrace{p(y \mid \theta)}_{\text{data-generating process}} \cdot \underbrace{p(I \mid y, \phi)}_{\text{missingness mechanism}}$$
+
+**But we only see $(y_{\text{obs}}, I)$** — so the observed-data distribution requires integrating out the missing values:
+
+$$p(y_{\text{obs}}, I \mid \theta, \phi) = \int p(y_{\text{obs}}, y_{\text{mis}} \mid \theta) \, p(I \mid y_{\text{obs}}, y_{\text{mis}}, \phi) \, dy_{\text{mis}}$$
+
+---
+
+# Types of Missing Data
+
+The key distinction lies in what the missingness depends on. There are three main categories, each with different implications for how we handle the missing values.
+
+```{r missing-types-table, echo=FALSE}
+types_df <- data.frame(
+  Regime = c("**MCAR**<br>(Missing Completely at Random)",
+             "**MAR**<br>(Missing at Random)",
+             "**MNAR**<br>(Missing Not at Random)"),
+  `Missingness depends on...` = c("Nothing (pure randomness)",
+                                   "Observed data only",
+                                   "The missing value itself"),
+  Formula = c("$p(I \\mid y, \\phi) = p(I \\mid \\phi)$",
+              "$p(I \\mid y, \\phi) = p(I \\mid y_{\\text{obs}}, \\phi)$",
+              "$p(I \\mid y, \\phi) = p(I \\mid y_{\\text{obs}}, y_{\\text{mis}}, \\phi)$"),
+  check.names = FALSE
+)
+
+kable(types_df, escape = FALSE, align = "ccc",
+      col.names = c("Regime", "Missingness depends on...", "Formula")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, width = "12em", bold = TRUE) %>%
+  column_spec(2, width = "12em") %>%
+  column_spec(3, width = "16em")
+```
+
+## Concrete Example: Age and Income Survey
+
+To make these concepts concrete, suppose we conduct a survey collecting $y = (\text{age}, \text{income})$. Age is always recorded, but income is sometimes missing. The *reason* for the missing income determines which regime we're in.
+
+```{r example-table, echo=FALSE}
+example_df <- data.frame(
+  Regime = c("**MCAR**", "**MAR**", "**MNAR**"),
+  `Why income is missing` = c(
+    "A random 10% of surveys get lost in the mail",
+    "Older respondents skip the money question more often",
+    "High earners refuse to disclose income"
+  ),
+  `What it looks like` = c(
+    "Missing rate flat across all ages and incomes",
+    "Missing rate rises with *age* (observed)",
+    "Missing rate depends on *income itself* (unobserved)"
+  ),
+  check.names = FALSE
+)
+
+kable(example_df, escape = FALSE, align = "ccc",
+      col.names = c("Regime", "Why income is missing", "What it looks like")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, width = "6em", bold = TRUE) %>%
+  column_spec(2, width = "16em") %>%
+  column_spec(3, width = "16em")
+```
+
+> **Key insight:** MCAR and MAR are called **ignorable** — we can model $p(y_{\text{obs}} \mid \theta)$ without explicitly modeling the missingness mechanism. MNAR requires modeling $p(I \mid y_{\text{mis}})$.
+
+---
+
+# Complete Case Analysis: The Default Approach
+
+The most common approach to missing data is **complete case analysis**: simply drop every row with any `NA` and fit the model as usual. While tempting in its simplicity, this approach has important limitations.
+
+- **Under MCAR:** Unbiased, but wastes partially complete rows (inefficient)
+- **Under MAR:** The answer is *subtle* — it depends on what variables are in your model
+- **Under MNAR:** Biased, because the complete-case sample is selected based on the outcome itself
+
+## A Subtle Point About MAR
+
+Here's a common misconception: "MAR always biases complete case analysis." This isn't quite right.
+
+**The key insight:** Under MAR, complete case analysis is unbiased for regression coefficients *if the variable driving missingness is included in the model*.
+
+In our example:
+- Missingness depends on **age**
+- Our model is `income ~ age`
+- By conditioning on age in our regression, we "control for" the selection mechanism
+- Therefore, CC gives unbiased estimates of the slope!
+
+**When does CC fail under MAR?**
+- When the selection variable is *not* in the analysis model
+- When estimating marginal quantities (like `mean(income)`) rather than conditional relationships
+- When there are complex patterns across multiple variables
+
+**So why use multiple imputation?**
+
+1. **Efficiency:** MI uses all the data, giving narrower credible intervals
+2. **Flexibility:** Works even when the selection variable isn't in your model
+3. **Multiple variables:** Handles complex missingness patterns across many variables
+4. **Marginal estimates:** Gives valid estimates for quantities like population means
+
+Let's see this in action with a simulation where *both* methods are approximately unbiased, but MI is more efficient.
+
+---
+
+## Generate Data with MAR Missingness
+
+We begin by simulating a dataset where income depends linearly on age, with a true relationship of $\text{income} = 20 + 0.8 \times \text{age} + \epsilon$. We then introduce MAR missingness: older respondents are more likely to skip the income question, but *given age*, the missingness does not depend on income itself.
+
+```{r generate-data}
+library(mice)
+library(ggplot2)
+library(brms)
+set.seed(123)
+
+# True relationship: income = 20 + 0.8 * age + noise
+n <- 500
+age <- round(runif(n, 25, 65))
+income <- 20 + 0.8 * age + rnorm(n, 0, 10)
+
+# MAR: older people less likely to report income
+# ~5% missing at age 25, ~70% missing at age 65
+income_observed <- income
+income_observed[runif(n) < plogis(-4 + 0.08 * age)] <- NA
+
+dat <- data.frame(age = age, income = income_observed)
+```
+
+---
+
+## Examining the Missingness Pattern
+
+Before jumping into modeling, we should always explore the pattern of missingness in our data. How much is missing? Does the missingness relate to observed variables?
+
+First, let's quantify the extent of missing data:
+
+```{r explore-missingness}
+# How much data is missing?
+n_missing <- sum(is.na(dat$income))
+cat(sprintf("Missing: %d of %d observations (%.1f%%)\n",
+            n_missing, n, 100 * n_missing / n))
+```
+
+Next, we visualize how missingness relates to age. If our MAR assumption is correct, we should see that older respondents are more likely to have missing income values.
+
+```{r visualize-missingness, fig.cap="Missingness pattern: older respondents are more likely to have missing income (MAR)."}
+# Visualize missingness by age
+dat$missing <- ifelse(is.na(dat$income), "Missing", "Observed")
+
+ggplot(dat, aes(x = age, fill = missing)) +
+  geom_histogram(binwidth = 5, position = "stack", color = "white") +
+  scale_fill_manual(values = c("Missing" = "#D55E00", "Observed" = "#0072B2")) +
+  labs(
+    title = "Distribution of Age by Missingness Status",
+    subtitle = "Under MAR, older respondents are more likely to have missing income",
+    x = "Age",
+    y = "Count",
+    fill = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+We can also compute the missingness rate directly by age group to confirm the MAR pattern:
+
+```{r missingness-rate, fig.cap="Probability of missing income increases with age."}
+# Missingness rate by age group
+dat$age_group <- cut(dat$age, breaks = seq(25, 65, by = 10), include.lowest = TRUE)
+miss_rate <- aggregate(missing ~ age_group, data = dat,
+                       FUN = function(x) mean(x == "Missing"))
+
+ggplot(miss_rate, aes(x = age_group, y = missing)) +
+  geom_col(fill = "#D55E00", alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.0f%%", 100 * missing)), vjust = -0.5) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "Missingness Rate by Age Group",
+    x = "Age Group",
+    y = "Proportion Missing"
+  ) +
+  theme_minimal()
+```
+
+As expected, the missingness rate increases substantially with age—this is exactly the MAR pattern we simulated.
+
+---
+
+# Solutions for Missing Data
+
+There are two main principled approaches to handling missing data in a Bayesian framework.
+
+## 1. Multiple Imputation (MI)
+
+Multiple imputation is a simulation-based approach that creates several "complete" versions of the dataset, each with different plausible values filled in for the missing entries.
+
+The procedure:
+
+1. Build an imputation model $p(y_{\text{mis}} \mid y_{\text{obs}})$
+2. Draw $K$ completed datasets $y^{(1)}, \ldots, y^{(K)}$
+3. Fit the analysis model *separately* to each completed dataset
+4. Pool the $K$ sets of results using **Rubin's rules**
+
+**Best for:** Datasets with many variables of mixed types; when you want to use familiar analysis tools.
+
+## 2. Data Augmentation (in Stan)
+
+An alternative is to treat the missing values as parameters and sample them jointly with the model parameters in a single MCMC run.
+
+- Declare `y_mis` in `parameters`
+- Reassemble full `y` in `transformed parameters`
+- In `model`, write *both* the imputation model *and* the analysis model
+
+**Best for:** When you're already using Stan; when you want a single coherent joint posterior; when propagating all sources of uncertainty is critical.
+
+In this tutorial, we focus on multiple imputation using the `mice` package.
+
+---
+
+# Multiple Imputation with `mice`
+
+## How `mice` Works: Chained Equations
+
+The `mice` package implements **Fully Conditional Specification (FCS)**, also known as chained equations. Rather than specifying a full joint distribution for all variables, FCS builds the imputation model from a series of conditional distributions.
+
+The algorithm:
+
+1. For each incomplete variable $Y_j$, specify a conditional model $p(Y_j \mid Y_{-j})$ (typically a regression)
+2. Initialize missing cells with simple values (e.g., random draws from observed values)
+3. Cycle through variables: draw $Y_j \mid Y_{-j}$ for every incomplete $j$
+4. Iterate until convergence. Save $K$ completed datasets spaced along the chain.
+
+**Strengths:** Handles mixed variable types flexibly; each conditional model is simple.
+
+**Caveat:** The collection of conditionals may not correspond to a valid joint distribution (the *compatibility problem*). In practice, this is rarely a serious issue.
+
+---
+
+## Running Multiple Imputation
+
+Now we apply `mice` to our simulated dataset. We generate $K = 5$ imputed datasets. The `mice` function automatically selects appropriate imputation methods for each variable type.
+
+```{r run-mice}
+# Multiple imputation with K = 5 datasets
+imp <- mice(dat[, c("age", "income")], m = 5, printFlag = FALSE)
+
+# Check the imputation method used for each variable
+imp$method
+```
+
+Since `age` has no missing values, no imputation is needed. For `income`, `mice` uses predictive mean matching (`pmm`) by default, which imputes missing values by matching to observed values with similar predicted means.
+
+---
+
+## Visualizing Imputed vs. Observed Values
+
+A crucial diagnostic is to check whether the imputed values are plausible. We compare the distribution of imputed values (orange) against observed values (blue) across all five imputations. If the imputation model is reasonable, these distributions should look similar.
+
+```{r plot-imputations, fig.cap="Imputed values (orange) should have similar distribution to observed values (blue) within each imputation."}
+# Build data for visualization
+missing_idx <- is.na(dat$income)
+
+plot_data <- data.frame(
+  income = dat$income[!missing_idx],
+  imputation = "Original\n(Observed)",
+  type = "Observed"
+)
+
+for (m in 1:5) {
+  completed <- complete(imp, m)
+  # Observed values
+  plot_data <- rbind(plot_data, data.frame(
+    income = completed$income[!missing_idx],
+    imputation = paste0("Imputation ", m),
+    type = "Observed"
+  ))
+  # Imputed values
+  plot_data <- rbind(plot_data, data.frame(
+    income = completed$income[missing_idx],
+    imputation = paste0("Imputation ", m),
+    type = "Imputed"
+  ))
+}
+
+ggplot(plot_data, aes(x = imputation, y = income, color = type)) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c("Imputed" = "#D55E00", "Observed" = "#0072B2")) +
+  labs(
+    title = "Imputed vs. Observed Income Distributions",
+    subtitle = "Each imputation draws different plausible values for missing data",
+    x = "",
+    y = "Income",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+The imputed values span the same range as the observed values, suggesting the imputation model is reasonable.
+
+---
+
+# Fitting a Bayesian Model with `brms`
+
+Now we fit our analysis model—a Bayesian linear regression of income on age. We'll compare two approaches:
+
+1. **Multiple Imputation:** Fit the model to all $K$ imputed datasets and pool results
+2. **Complete Case Analysis:** Fit the model only to observations with no missing values
+
+The `brms` package provides `brm_multiple()`, which automatically fits the model to each imputed dataset and combines the posterior draws.
+
+---
+
+## Fit Model on Imputed Data
+
+We specify weakly informative priors and fit the model to all five imputed datasets. The `brm_multiple()` function handles the pooling automatically.
+
+```{r fit-brms-mi, results='hide', cache=TRUE}
+# Fit Bayesian model on multiply imputed data
+fit_mi <- brm_multiple(
+  income ~ age,
+  data = imp,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 50), class = Intercept),
+    prior(normal(0, 5), class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 123,
+  silent = 2,
+  refresh = 0
+)
+```
+
+```{r mi-summary}
+summary(fit_mi)
+```
+
+---
+
+## Fit Model on Complete Cases Only
+
+For comparison, we also fit the same model using only the complete cases—observations where income is not missing. This discards a substantial portion of our data.
+
+```{r fit-brms-cc, results='hide', cache=TRUE}
+# Complete case analysis
+dat_cc <- dat[complete.cases(dat), ]
+cat(sprintf("Complete cases: %d of %d (%.1f%% of data used)\n",
+            nrow(dat_cc), nrow(dat), 100 * nrow(dat_cc) / nrow(dat)))
+
+fit_cc <- brm(
+  income ~ age,
+  data = dat_cc,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 50), class = Intercept),
+    prior(normal(0, 5), class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 123,
+  silent = 2,
+  refresh = 0
+)
+```
+
+```{r cc-summary}
+summary(fit_cc)
+```
+
+---
+
+# Comparing the Two Approaches
+
+Now we compare the estimates from multiple imputation and complete case analysis against the true parameter values we used in the simulation.
+
+## Extract Coefficients
+
+```{r extract-coefs}
+# Multiple Imputation estimates
+pooled_coef <- fixef(fit_mi)
+intercept_mi <- pooled_coef["Intercept", "Estimate"]
+slope_mi <- pooled_coef["age", "Estimate"]
+
+# Complete Case estimates
+cc_coef <- fixef(fit_cc)
+intercept_cc <- cc_coef["Intercept", "Estimate"]
+slope_cc <- cc_coef["age", "Estimate"]
+
+# True values
+true_intercept <- 20
+true_slope <- 0.8
+```
+
+---
+
+## Comparison Table
+
+The table below summarizes the point estimates and 95% credible intervals for both methods, alongside the true values.
+
+```{r comparison-table, echo=FALSE}
+comparison <- data.frame(
+  Method = c("True Value", "Multiple Imputation", "Complete Cases"),
+  Intercept = c(sprintf("%.2f", true_intercept),
+                sprintf("%.2f", intercept_mi),
+                sprintf("%.2f", intercept_cc)),
+  `Intercept 95% CI` = c(
+    "—",
+    sprintf("(%.2f, %.2f)", pooled_coef["Intercept", "Q2.5"], pooled_coef["Intercept", "Q97.5"]),
+    sprintf("(%.2f, %.2f)", cc_coef["Intercept", "Q2.5"], cc_coef["Intercept", "Q97.5"])
+  ),
+  Slope = c(sprintf("%.2f", true_slope),
+            sprintf("%.2f", slope_mi),
+            sprintf("%.2f", slope_cc)),
+  `Slope 95% CI` = c(
+    "—",
+    sprintf("(%.2f, %.2f)", pooled_coef["age", "Q2.5"], pooled_coef["age", "Q97.5"]),
+    sprintf("(%.2f, %.2f)", cc_coef["age", "Q2.5"], cc_coef["age", "Q97.5"])
+  ),
+  check.names = FALSE
+)
+
+kable(comparison, escape = FALSE, align = "ccccc",
+      col.names = c("Method", "Intercept", "Intercept 95% CI", "Slope", "Slope 95% CI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:5, width = "8em") %>%
+  row_spec(1, background = "#f0f0f0")
+```
+
+### Interpreting the Results
+
+You might notice that both methods give estimates reasonably close to the true values, and in any single run, complete cases might even appear closer to the truth. **This is expected!**
+
+Remember our earlier discussion: because missingness depends on `age` and `age` is in our model, complete case analysis is *also unbiased* in this scenario. Both methods are targeting the same true parameter—any differences are due to random sampling variability.
+
+**What should we look for then?**
+
+The key advantage of MI here is **efficiency**—it should produce narrower credible intervals because it uses all 500 observations rather than discarding the ~40% with missing income. Let's check this below.
+
+> **Important:** In a single simulation run, random variability can make either method appear "better." To truly compare bias, you would need to repeat this simulation many times and look at the average estimates. For our purposes, we focus on the width of the credible intervals.
+
+---
+
+## Efficiency Comparison
+
+Beyond point estimates, we should compare the *precision* of our estimates. Multiple imputation uses all the data, so we expect narrower credible intervals (higher efficiency).
+
+```{r efficiency}
+ci_width_mi <- pooled_coef["age", "Q97.5"] - pooled_coef["age", "Q2.5"]
+ci_width_cc <- cc_coef["age", "Q97.5"] - cc_coef["age", "Q2.5"]
+
+cat(sprintf("95%% CI width for slope (age):
+  Multiple Imputation: %.4f
+  Complete Cases:      %.4f
+  Efficiency gain:     %.1f%%\n",
+  ci_width_mi, ci_width_cc, 100 * (1 - ci_width_mi / ci_width_cc)))
+```
+
+The multiple imputation approach yields a narrower credible interval, reflecting the efficiency gain from using all available data.
+
+---
+
+## Visual Comparison
+
+Finally, we visualize both fitted regression lines with their 95% credible bands. The true regression line is shown as a dashed black line for reference.
+
+```{r comparison-plot, fig.width=10, fig.height=6, fig.cap="Multiple imputation (blue) vs. complete case analysis (orange). Under MAR, both are unbiased, but MI has narrower credible intervals."}
+# Get posteriors
+posterior_mi <- as_draws_df(fit_mi)
+posterior_cc <- as_draws_df(fit_cc)
+
+# Compute 95% CI bands
+age_seq <- seq(25, 65, length.out = 100)
+
+# Multiple Imputation CI
+mi_fitted <- sapply(age_seq, function(a) {
+  posterior_mi$b_Intercept + posterior_mi$b_age * a
+})
+mi_ci <- data.frame(
+  age = age_seq,
+  mean = intercept_mi + slope_mi * age_seq,
+  lower = apply(mi_fitted, 2, quantile, 0.025),
+  upper = apply(mi_fitted, 2, quantile, 0.975),
+  model = "Multiple Imputation"
+)
+
+# Complete Cases CI
+cc_fitted <- sapply(age_seq, function(a) {
+  posterior_cc$b_Intercept + posterior_cc$b_age * a
+})
+cc_ci <- data.frame(
+  age = age_seq,
+  mean = intercept_cc + slope_cc * age_seq,
+  lower = apply(cc_fitted, 2, quantile, 0.025),
+  upper = apply(cc_fitted, 2, quantile, 0.975),
+  model = "Complete Cases"
+)
+
+ci_data <- rbind(mi_ci, cc_ci)
+
+# Observed data for scatter plot
+obs_data <- dat[!is.na(dat$income), ]
+
+ggplot() +
+  geom_point(data = obs_data, aes(x = age, y = income),
+             color = "grey60", alpha = 0.4) +
+  # Shaded CI bands
+  geom_ribbon(data = ci_data,
+              aes(x = age, ymin = lower, ymax = upper, fill = model),
+              alpha = 0.3) +
+  # Mean lines
+  geom_line(data = ci_data,
+            aes(x = age, y = mean, color = model),
+            linewidth = 1.2) +
+  # True regression line
+  geom_abline(intercept = 20, slope = 0.8,
+              linetype = "dashed", linewidth = 1.2, color = "black") +
+  scale_color_manual(values = c("Complete Cases" = "#E69F00",
+                                "Multiple Imputation" = "#0072B2")) +
+  scale_fill_manual(values = c("Complete Cases" = "#E69F00",
+                               "Multiple Imputation" = "#0072B2")) +
+  labs(
+    title = "Multiple Imputation vs. Complete Case Analysis",
+    subtitle = "Shaded regions: 95% CI | Dashed black: True regression line",
+    x = "Age",
+    y = "Income",
+    color = "Model",
+    fill = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### What Do We See?
+
+Both methods recover estimates close to the true line (dashed black). This confirms our earlier point: in this MAR scenario where missingness depends on age and age is in our model, **both methods are unbiased**.
+
+The key difference is in the *width* of the credible bands. The multiple imputation band (blue) should be narrower than the complete case band (orange), reflecting the **efficiency gain** from using all 500 observations rather than discarding those with missing income.
+
+This is the main practical advantage of MI in this scenario: not bias correction, but better precision in our estimates.
+
+---
+
+# When Both Methods Fail: MNAR
+
+So far we've seen that under MAR (when missingness depends on observed variables), both methods can be unbiased. But what happens when missingness depends on the *unobserved value itself*? This is **Missing Not At Random (MNAR)**, and it's where things get tricky.
+
+## The Problem with MNAR
+
+Under MNAR, the probability of observing a value depends on what that value *would have been*. Classic examples:
+
+- **High earners hide their income** — wealthy respondents refuse to disclose
+- **Sick patients drop out** — the sickest people leave a clinical trial
+- **Censoring in survival analysis** — patients die before the study ends
+
+The fundamental problem: the observed data is a *biased sample* of the complete data. No amount of clever imputation from observed values can recover what we're systematically missing.
+
+## Simulating MNAR Data
+
+Let's create a scenario where **high-income people are less likely to report their income**. We use the same true relationship as before, but now missingness depends on income itself.
+
+```{r generate-mnar}
+set.seed(456)
+
+# Generate fresh data with same true relationship
+n_mnar <- 500
+age_mnar <- round(runif(n_mnar, 25, 65))
+income_mnar_full <- 20 + 0.8 * age_mnar + rnorm(n_mnar, 0, 10)
+
+# MNAR: HIGH income people are LESS likely to report (hiding wealth)
+# Missingness probability increases with income
+# ~10% missing at income=30, ~60% missing at income=80
+income_mnar <- income_mnar_full
+miss_prob <- plogis(-3 + 0.05 * income_mnar_full)
+income_mnar[runif(n_mnar) < miss_prob] <- NA
+
+dat_mnar <- data.frame(age = age_mnar, income = income_mnar)
+```
+
+Let's examine how this MNAR mechanism distorts our observed data:
+
+```{r mnar-diagnostics}
+cat(sprintf("MNAR Missing: %d of %d (%.1f%%)\n",
+            sum(is.na(income_mnar)), n_mnar, 100*mean(is.na(income_mnar))))
+cat(sprintf("Mean income (full data):     %.2f\n", mean(income_mnar_full)))
+cat(sprintf("Mean income (observed only): %.2f\n", mean(income_mnar, na.rm = TRUE)))
+```
+
+Notice that the observed mean is **lower** than the true mean. This is the signature of MNAR: because high earners hide their income, our observed sample is systematically biased toward lower incomes.
+
+---
+
+## Fitting Models to MNAR Data
+
+Now let's see what happens when we apply our two methods (MI and CC) to this MNAR data. Both methods assume MAR, so both will be biased.
+
+```{r fit-mnar-mi, results='hide', cache=TRUE}
+# Multiple imputation on MNAR data
+imp_mnar <- mice(dat_mnar, m = 5, printFlag = FALSE)
+
+# Fit Bayesian model with MI
+fit_mnar_mi <- brm_multiple(
+  income ~ age,
+  data = imp_mnar,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 50), class = Intercept),
+    prior(normal(0, 5), class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 456,
+  silent = 2,
+  refresh = 0
+)
+```
+
+```{r fit-mnar-cc, results='hide', cache=TRUE}
+# Complete case analysis on MNAR data
+dat_mnar_cc <- dat_mnar[complete.cases(dat_mnar), ]
+
+fit_mnar_cc <- brm(
+  income ~ age,
+  data = dat_mnar_cc,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 50), class = Intercept),
+    prior(normal(0, 5), class = b),
+    prior(exponential(0.1), class = sigma)
+  ),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 456,
+  silent = 2,
+  refresh = 0
+)
+```
+
+---
+
+## MNAR Results: Both Methods Fail
+
+```{r mnar-results}
+# Extract coefficients
+mnar_mi_coef <- fixef(fit_mnar_mi)
+mnar_cc_coef <- fixef(fit_mnar_cc)
+
+# Calculate bias
+mi_intercept_bias <- mnar_mi_coef["Intercept", "Estimate"] - 20
+mi_slope_bias <- mnar_mi_coef["age", "Estimate"] - 0.8
+cc_intercept_bias <- mnar_cc_coef["Intercept", "Estimate"] - 20
+cc_slope_bias <- mnar_cc_coef["age", "Estimate"] - 0.8
+```
+
+```{r mnar-table, echo=FALSE}
+mnar_comparison <- data.frame(
+  Method = c("True Value", "Multiple Imputation", "Complete Cases"),
+  Intercept = c("20.00",
+                sprintf("%.2f", mnar_mi_coef["Intercept", "Estimate"]),
+                sprintf("%.2f", mnar_cc_coef["Intercept", "Estimate"])),
+  `Intercept Bias` = c("—",
+                       sprintf("%.2f", mi_intercept_bias),
+                       sprintf("%.2f", cc_intercept_bias)),
+  Slope = c("0.80",
+            sprintf("%.2f", mnar_mi_coef["age", "Estimate"]),
+            sprintf("%.2f", mnar_cc_coef["age", "Estimate"])),
+  `Slope Bias` = c("—",
+                   sprintf("%.3f", mi_slope_bias),
+                   sprintf("%.3f", cc_slope_bias)),
+  check.names = FALSE
+)
+
+kable(mnar_comparison, escape = FALSE, align = "ccccc",
+      col.names = c("Method", "Intercept", "Intercept Bias", "Slope", "Slope Bias")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:5, width = "7em") %>%
+  row_spec(1, background = "#f0f0f0")
+```
+
+**Both methods show bias**, particularly in the intercept. The intercept is biased downward because we systematically miss high-income observations at every age level.
+
+---
+
+## Visualizing MNAR Bias
+
+The plot below shows the key insight: the red X marks indicate where the missing high-income observations *would have been*. Both fitted lines are pulled downward away from the true regression line.
+
+```{r mnar-plot, fig.width=10, fig.height=6, fig.cap="Under MNAR, both methods are biased. Red X marks show the missing high-income observations."}
+missing_idx_mnar <- is.na(dat_mnar$income)
+obs_data_mnar <- dat_mnar[!missing_idx_mnar, ]
+
+posterior_mnar_mi <- as_draws_df(fit_mnar_mi)
+posterior_mnar_cc <- as_draws_df(fit_mnar_cc)
+
+# Compute CI bands
+mnar_mi_fitted <- sapply(age_seq, function(a) {
+  posterior_mnar_mi$b_Intercept + posterior_mnar_mi$b_age * a
+})
+mnar_mi_ci <- data.frame(
+  age = age_seq,
+  mean = mnar_mi_coef["Intercept", "Estimate"] + mnar_mi_coef["age", "Estimate"] * age_seq,
+  lower = apply(mnar_mi_fitted, 2, quantile, 0.025),
+  upper = apply(mnar_mi_fitted, 2, quantile, 0.975),
+  model = "Multiple Imputation"
+)
+
+mnar_cc_fitted <- sapply(age_seq, function(a) {
+  posterior_mnar_cc$b_Intercept + posterior_mnar_cc$b_age * a
+})
+mnar_cc_ci <- data.frame(
+  age = age_seq,
+  mean = mnar_cc_coef["Intercept", "Estimate"] + mnar_cc_coef["age", "Estimate"] * age_seq,
+  lower = apply(mnar_cc_fitted, 2, quantile, 0.025),
+  upper = apply(mnar_cc_fitted, 2, quantile, 0.975),
+  model = "Complete Cases"
+)
+
+mnar_ci_data <- rbind(mnar_mi_ci, mnar_cc_ci)
+
+ggplot() +
+  geom_point(data = obs_data_mnar, aes(x = age, y = income),
+             color = "grey70", alpha = 0.5) +
+  # Show where missing data would have been (use full data)
+  geom_point(data = data.frame(age = age_mnar[missing_idx_mnar],
+                                income = income_mnar_full[missing_idx_mnar]),
+             aes(x = age, y = income),
+             color = "red", alpha = 0.4, shape = 4, size = 2) +
+  # Shaded CI bands
+  geom_ribbon(data = mnar_ci_data,
+              aes(x = age, ymin = lower, ymax = upper, fill = model),
+              alpha = 0.3) +
+  # Mean lines
+  geom_line(data = mnar_ci_data,
+            aes(x = age, y = mean, color = model),
+            linewidth = 1.2) +
+  # True regression line
+  geom_abline(intercept = 20, slope = 0.8,
+              linetype = "dashed", linewidth = 1.2, color = "black") +
+  scale_color_manual(values = c("Complete Cases" = "#E69F00",
+                                 "Multiple Imputation" = "#0072B2")) +
+  scale_fill_manual(values = c("Complete Cases" = "#E69F00",
+                                "Multiple Imputation" = "#0072B2")) +
+  labs(
+    title = "MNAR: Both Methods Fail When Missingness Depends on Income",
+    subtitle = "Red X: Missing high-income observations | Dashed black: True regression line",
+    x = "Age",
+    y = "Income",
+    color = "Model",
+    fill = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### What Do We See?
+
+The **red X marks** reveal the problem: at every age level, the missing values are systematically higher than the observed values. This is the hallmark of MNAR — the missingness is informative about what the missing value would have been.
+
+Both fitted lines are pulled downward. The **true line (dashed black)** passes through the center of all the data, but our methods only see the grey dots and produce biased estimates.
+
+### What Can We Do About MNAR?
+
+Standard approaches like MI and CC cannot solve MNAR because they assume the missingness mechanism is ignorable. To handle MNAR, you need to:
+
+1. **Model the missingness mechanism explicitly** — use selection models or pattern-mixture models
+2. **Conduct sensitivity analyses** — vary assumptions about the MNAR mechanism and see how results change
+3. **Use external information** — incorporate prior knowledge about why values are missing
+
+These approaches require strong assumptions and are beyond the scope of this tutorial, but the key takeaway is: **if you suspect MNAR, neither MI nor CC will save you**.
+
+---
+
+# Key Takeaways
+
+## When to Use Multiple Imputation
+
+1. **Efficiency:** MI uses all the data, giving narrower credible intervals
+2. **Flexibility:** Works even when the selection variable isn't in your analysis model
+3. **Multiple variables:** Handles complex missingness patterns across many variables
+4. **Marginal estimates:** Gives valid estimates for population means and other marginal quantities
+
+## When is Complete Case Analysis Acceptable?
+
+Complete case analysis can be unbiased under MAR *if* the variables driving missingness are included in your model. However, you still lose efficiency by discarding data.
+
+**Use CC when:**
+- Missingness is truly MCAR
+- The fraction of missing data is very small
+- The selection variables are already in your model and you only care about conditional relationships
+
+## Congeniality Principle
+
+> *The imputation model must be at least as rich as the analysis model.* (Meng, 1994)
+
+**Failure mode:**
+
+- Analysis model contains an interaction $X_1 \times X_2$
+- Imputation model for $X_1 \mid X_2$ is purely linear
+- Imputations smooth out the interaction; analysis cannot recover it
+
+**Rule:** Include every variable and nonlinearity the analysis model uses. When in doubt, include more.
+
+---
+
+## Summary: When Does Each Method Work?
+
+```{r summary-table, echo=FALSE}
+summary_df <- data.frame(
+  Scenario = c("**MCAR**", "**MAR**<br>(selection var in model)", "**MAR**<br>(selection var NOT in model)", "**MNAR**"),
+  `Complete Cases` = c("Unbiased, inefficient", "Unbiased, inefficient", "Biased", "Biased"),
+  `Multiple Imputation` = c("Unbiased, efficient", "Unbiased, efficient", "Unbiased, efficient", "Biased (assumes MAR)"),
+  check.names = FALSE
+)
+
+kable(summary_df, escape = FALSE, align = "ccc",
+      col.names = c("Scenario", "Complete Cases", "Multiple Imputation")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "14em") %>%
+  column_spec(2:3, width = "10em")
+```
+
+> **Bottom line:** Multiple imputation is never worse than complete case analysis—at worst, it's equally unbiased but more efficient. Under MAR where the selection mechanism isn't controlled for in your model, MI can eliminate bias that CC cannot. Under MNAR, neither simple approach works; you need to explicitly model the missingness mechanism.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

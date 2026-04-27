@@ -1,0 +1,712 @@
+---
+title: "Handling MNAR Data: A Bayesian Sensitivity Analysis"
+author: "Team 4"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+library(kableExtra)
+```
+
+# Introduction
+
+In the previous tutorial, we saw that **Missing At Random (MAR)** data can be handled well using multiple imputation or data augmentation. But what happens when the missingness depends on the *unobserved value itself*? This is **Missing Not At Random (MNAR)**, and it requires a fundamentally different approach.
+
+This tutorial demonstrates:
+
+1. The difference between **selection models** and **pattern-mixture models** for MNAR
+2. **Bayesian data augmentation** using `brms` with the `mi()` syntax
+3. **Sensitivity analysis** across different missingness assumptions
+4. How to assess whether conclusions are **robust** to MNAR departures
+
+We use real data from the **NHANES** (National Health and Nutrition Examination Survey) to investigate the relationship between total cholesterol and blood pressure.
+
+---
+
+# MNAR Models: Two Frameworks
+
+Under MNAR, the missingness mechanism depends on $y_{\text{mis}}$ and **cannot be ignored**. There are two main frameworks for modeling MNAR data.
+
+## Selection Models
+
+**Factorization:** $p(y, I) = p(y \mid \theta) \cdot p(I \mid y, \phi)$
+
+In a selection model, we:
+1. Specify a model for the complete data $p(y \mid \theta)$
+2. Specify a model for the probability of being observed $p(I \mid y, \phi)$
+
+The missingness model explicitly depends on the (potentially unobserved) value of $y$.
+
+**Example:** In a survey, the probability of reporting income depends on income itself:
+$$P(\text{report income}) = \text{logit}^{-1}(\alpha + \beta \cdot \text{income})$$
+
+## Pattern-Mixture Models
+
+**Factorization:** $p(y, I) = p(y \mid I, \theta_I) \cdot p(I \mid \phi)$
+
+In a pattern-mixture model, we:
+1. Specify **separate outcome distributions** for each missingness pattern
+2. Think of completers and non-completers as coming from different populations
+
+**Example:** In a clinical trial, patients who drop out (missing) may have systematically different outcomes than completers. We model:
+- $y \mid \text{completer} \sim N(\mu_1, \sigma^2)$
+- $y \mid \text{dropout} \sim N(\mu_2, \sigma^2)$
+
+This is natural for dropout scenarios: we explicitly parameterize the difference between populations.
+
+---
+
+## The Fundamental Problem with MNAR
+
+```{r mnar-warning, echo=FALSE}
+warning_df <- data.frame(
+  Issue = c("**Untestable**", "**Requires assumptions**", "**Sensitivity analysis**"),
+  Explanation = c(
+    "We cannot verify MNAR from observed data alone",
+    "Results depend heavily on the assumed MNAR mechanism",
+    "The standard approach is to fit under multiple assumptions and report the range of results"
+  )
+)
+
+kable(warning_df, escape = FALSE, col.names = c("Issue", "Explanation")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2, width = "30em")
+```
+
+> **Key insight:** Under MNAR, we cannot determine the "correct" model from data. Instead, we conduct **sensitivity analyses** across plausible MNAR mechanisms and report whether our conclusions are robust.
+
+---
+
+# Applied Example: NHANES
+
+## The Data
+
+We use data from the **US National Health and Nutrition Examination Survey (2009-2012)**, available via the `NHANES` R package. After filtering to adults (age ≥ 18), we have approximately 7,150 observations.
+
+**Research question:** How does total cholesterol associate with systolic blood pressure, adjusting for age and BMI?
+
+**Variables:**
+
+```{r vars-table, echo=FALSE}
+vars_df <- data.frame(
+  Variable = c("`BPSysAve`", "`Age`", "`BMI`", "`TotChol`", "`Weight`, `Gender`"),
+  Description = c(
+    "Average systolic blood pressure (mmHg) — **outcome**",
+    "Age in years — fully observed",
+    "Body mass index — fully observed",
+    "Total cholesterol (mmol/L) — **missing for ~5%**",
+    "Auxiliary predictors for imputation model"
+  )
+)
+
+kable(vars_df, escape = FALSE, col.names = c("Variable", "Description")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em", extra_css = "font-family: monospace;") %>%
+  column_spec(2, width = "28em")
+```
+
+**Why is TotChol missing?** NHANES assigns participants to a fasting subsample for lab measurements. Whether someone is assigned depends on logistical factors (survey design), not on their cholesterol level. This makes **MAR** (conditional on observed covariates) a defensible assumption—but we'll test sensitivity to MNAR.
+
+---
+
+## Data Preparation
+
+```{r load-data}
+library(NHANES)
+library(brms)
+library(dplyr)
+library(tidyr)
+library(bayesplot)
+library(ggplot2)
+library(posterior)
+
+set.seed(5440)
+
+# Filter to adults with complete covariates
+nhanes_dat <- NHANES %>%
+  filter(Age >= 18) %>%
+  select(BPSysAve, Age, BMI, Weight, Gender, TotChol) %>%
+  drop_na(BPSysAve, Age, BMI, Weight, Gender) %>%
+  mutate(
+    # Standardize all continuous predictors (mean=0, sd=1)
+    Age_z = scale(Age)[,1],
+    Age_zsq = Age_z^2,  # Quadratic term for non-linearity
+    BMI_z = scale(BMI)[,1],
+    Weight_z = scale(Weight)[,1],
+    age_quartile = ntile(Age, 4)
+  )
+```
+
+Let's examine the extent of missingness:
+
+```{r examine-missing}
+cat(sprintf("Total adult observations: %d\n", nrow(nhanes_dat)))
+cat(sprintf("Missing TotChol: %d (%.1f%%)\n",
+            sum(is.na(nhanes_dat$TotChol)),
+            100 * mean(is.na(nhanes_dat$TotChol))))
+```
+
+With only ~5% missing, complete case analysis might seem reasonable. However, we want to:
+1. Use all available data (efficiency)
+2. Understand sensitivity to the MAR assumption
+3. Demonstrate the Bayesian data augmentation approach
+
+---
+
+## Visualizing the Data
+
+Before modeling, let's examine the distributions of our key variables.
+
+```{r viz-data, fig.height=4}
+# Blood pressure distribution
+ggplot(nhanes_dat, aes(x = BPSysAve)) +
+  geom_histogram(binwidth = 5, fill = "#0072B2", color = "white", alpha = 0.7) +
+  labs(title = "Distribution of Systolic Blood Pressure",
+       x = "Average Systolic BP (mmHg)", y = "Count") +
+  theme_minimal()
+```
+
+```{r viz-chol, fig.height=4}
+# Cholesterol distribution (observed only)
+ggplot(nhanes_dat, aes(x = TotChol)) +
+  geom_histogram(binwidth = 0.2, fill = "#D55E00", color = "white", alpha = 0.7) +
+  labs(title = "Distribution of Total Cholesterol (Observed Values)",
+       subtitle = sprintf("Mean: %.2f mmol/L, SD: %.2f mmol/L",
+                          mean(nhanes_dat$TotChol, na.rm = TRUE),
+                          sd(nhanes_dat$TotChol, na.rm = TRUE)),
+       x = "Total Cholesterol (mmol/L)", y = "Count") +
+  theme_minimal()
+```
+
+---
+
+# Bayesian Data Augmentation with `brms`
+
+## Model Specification
+
+We use `brms` with the `mi()` syntax to perform **Bayesian data augmentation**. This treats the missing TotChol values as parameters and samples them jointly with the regression coefficients in a single MCMC run.
+
+**Outcome model** (blood pressure):
+$$\text{BPSysAve}_i = \alpha + \beta_{\text{age}} \text{Age}^*_i + \beta_{\text{age}^2} (\text{Age}^*_i)^2 + \beta_{\text{BMI}} \text{BMI}^*_i + \beta_{\text{TC}} \text{TotChol}_i + \varepsilon_i, \quad \varepsilon_i \sim N(0, \sigma^2)$$
+
+where $^*$ denotes standardized variables (mean 0, SD 1). We **standardize continuous predictors** to ensure stable prior specification—this prevents numerical issues when predictors are on very different scales. We include a **quadratic age term** because the relationship between age and blood pressure is often non-linear—BP tends to rise more steeply at older ages.
+
+**Imputation model** (cholesterol):
+$$\text{TotChol}_i = \gamma_0 + \gamma_{\text{age}} \text{Age}^*_i + \gamma_{\text{BMI}} \text{BMI}^*_i + \gamma_{\text{wt}} \text{Weight}^*_i + \gamma_{\text{gen}} \text{Gender}_i + \eta_i, \quad \eta_i \sim N(0, \sigma_{\text{TC}}^2)$$
+
+The imputation model uses additional predictors (Weight, Gender) that aren't in the outcome model—this is the **congeniality principle** in action: the imputation model should be at least as rich as the analysis model.
+
+```{r model-formula}
+# brms formula with mi() for missing predictor
+# Use standardized predictors for stable prior specification
+# Include quadratic age term for non-linear age-BP relationship
+bform <- bf(BPSysAve ~ Age_z + Age_zsq + BMI_z + mi(TotChol)) +
+         bf(TotChol | mi() ~ Age_z + BMI_z + Weight_z + Gender) +
+         set_rescor(FALSE)
+```
+
+---
+
+## Prior Specification
+
+We choose **informative priors** based on domain knowledge. Tighter priors produce a more meaningful prior predictive check and can improve sampling efficiency:
+
+```{r priors-table, echo=FALSE}
+priors_df <- data.frame(
+  Parameter = c("$\\alpha$ (intercept)", "$\\beta_{\\text{age}}$", "$\\beta_{\\text{age}^2}$",
+                "$\\beta_{\\text{BMI}}$", "$\\beta_{\\text{TC}}$", "$\\sigma$",
+                "$\\gamma_0$ (TC intercept)", "$\\gamma_{\\cdot}$ (TC slopes)", "$\\sigma_{\\text{TC}}$"),
+  Prior = c("$N(120, 10^2)$", "$N(5, 3^2)$", "$N(0, 2^2)$",
+            "$N(3, 2^2)$", "$N(1, 1^2)$", "$N^+(15, 5^2)$",
+            "$N(5, 1^2)$", "$N(0, 0.3^2)$", "$N^+(1, 0.5^2)$"),
+  Rationale = c("Adult SBP typically 110-130 mmHg at mean age",
+                "~5 mmHg per SD of age (SD ~17 years)",
+                "Modest curvature in age-BP relationship",
+                "~3 mmHg per SD of BMI (SD ~7 units)",
+                "1-2 mmHg per mmol/L cholesterol is plausible",
+                "Residual SD ~15 mmHg is typical for BP models",
+                "Adult TotChol mean ~5 mmol/L",
+                "Modest standardized effects on cholesterol",
+                "TotChol SD ~1 mmol/L")
+)
+
+kable(priors_df, escape = FALSE, col.names = c("Parameter", "Prior", "Rationale")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, width = "10em") %>%
+  column_spec(2, width = "8em") %>%
+  column_spec(3, width = "20em")
+```
+
+```{r set-priors}
+bp_priors <- c(
+  # Outcome model - priors for standardized predictors
+  # Coefficients now represent effect of 1 SD change in predictor
+  prior(normal(120, 10), class = "Intercept", resp = "BPSysAve"),
+  prior(normal(5, 3),    class = "b", coef = "Age_z",     resp = "BPSysAve"),
+  prior(normal(0, 2),    class = "b", coef = "Age_zsq",   resp = "BPSysAve"),
+  prior(normal(3, 2),    class = "b", coef = "BMI_z",     resp = "BPSysAve"),
+  prior(normal(1, 1),    class = "b", coef = "miTotChol", resp = "BPSysAve"),
+  prior(normal(15, 5),   class = "sigma",                 resp = "BPSysAve"),
+
+  # Imputation model (TotChol in mmol/L, predictors standardized)
+  prior(normal(5, 1),    class = "Intercept", resp = "TotChol"),
+  prior(normal(0, 0.3),  class = "b",         resp = "TotChol"),
+  prior(normal(1, 0.5),  class = "sigma",     resp = "TotChol")
+)
+```
+
+---
+
+## Prior Predictive Check
+
+Before fitting to data, we check that our priors generate plausible predictions. This ensures we haven't accidentally specified priors that are too narrow or too wide.
+
+> **Note:** Prior predictive checks with `mi()` models can be numerically unstable because the imputation model samples missing values from unbounded prior distributions. We run the prior predictive check on a simplified model (complete cases only) to verify our blood pressure priors are sensible.
+
+```{r prior-predictive, results='hide', cache=TRUE}
+# Use complete cases for prior predictive check (avoids mi() instability)
+nhanes_cc_prior <- drop_na(nhanes_dat, TotChol)
+
+fit_prior <- brm(
+  formula      = BPSysAve ~ Age_z + Age_zsq + BMI_z + TotChol,
+  data         = nhanes_cc_prior,
+  prior        = c(
+    prior(normal(120, 10), class = "Intercept"),
+    prior(normal(5, 3),    class = "b", coef = "Age_z"),
+    prior(normal(0, 2),    class = "b", coef = "Age_zsq"),
+    prior(normal(3, 2),    class = "b", coef = "BMI_z"),
+    prior(normal(1, 1),    class = "b", coef = "TotChol"),
+    prior(normal(15, 5),   class = "sigma")
+  ),
+  sample_prior = "only",
+  chains       = 2,
+  iter         = 1000,
+  seed         = 5440,
+  refresh      = 0
+)
+```
+
+```{r prior-ppc-plot, fig.cap="Prior predictive check: the prior predictive distribution (light blue) should overlap with the observed data (dark blue)."}
+pp_check(fit_prior, ndraws = 100) +
+  ggtitle("Prior Predictive Check") +
+  theme_minimal()
+```
+
+With our **informative priors**, the prior predictive draws (light blue) form a distribution centered around plausible blood pressure values rather than spreading uniformly. The observed data distribution (dark blue) should fall within the prior predictive range. If the prior predictive were too narrow and missed the observed data, we would need to widen our priors. If it were too diffuse (flat lines), our priors wouldn't be contributing much information.
+
+---
+
+# Fitting the MAR Model
+
+Now we fit the full model under the MAR assumption. The `mi()` syntax tells `brms` to impute missing TotChol values as part of the MCMC sampling.
+
+```{r fit-mar, results='hide', cache=TRUE}
+fit_mar <- brm(
+  formula = bform,
+  data    = nhanes_dat,
+  prior   = bp_priors,
+  chains  = 4,
+  iter    = 2000,
+  warmup  = 1000,
+  seed    = 5440,
+  refresh = 0,
+  backend = "rstan",
+  control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+```
+
+---
+
+## MCMC Diagnostics
+
+Before interpreting results, we must verify that the MCMC sampler has converged.
+
+```{r diagnostics}
+# Discover actual parameter names from the model
+all_pars <- variables(fit_mar)
+cat("All parameters in model:\n")
+print(all_pars[grepl("^b_|^bsp_|^sigma", all_pars)])
+
+# Key parameters to check - use pattern matching to find them
+key_pars <- all_pars[grepl("^b_BPSysAve_|^bsp_BPSysAve_|^sigma_BPSysAve", all_pars)]
+key_pars <- key_pars[!grepl("Ymi_", key_pars)]  # Exclude imputed values
+cat("\nKey parameters for diagnostics:\n")
+print(key_pars)
+
+cat("\nR-hat values (should be < 1.01):\n")
+print(round(brms::rhat(fit_mar)[key_pars], 4))
+
+cat("\nEffective sample size ratios (should be > 0.1):\n")
+print(round(brms::neff_ratio(fit_mar)[key_pars], 3))
+```
+
+```{r trace-plots, fig.height=7, fig.cap="Trace plots show good mixing across all four chains."}
+mcmc_trace(fit_mar, pars = key_pars) +
+  ggtitle("MCMC Trace Plots")
+```
+
+All $\hat{R}$ values are close to 1.00, and effective sample sizes are adequate. The trace plots show good mixing with no obvious trends or stuck chains.
+
+---
+
+## Posterior Summaries
+
+```{r posterior-summary}
+summary(fit_mar)
+```
+
+Let's extract the key results in a cleaner format:
+
+```{r results-table}
+post_sum <- posterior_summary(fit_mar, variable = key_pars)
+
+# Create nice labels for parameters
+param_labels <- gsub("b_BPSysAve_", "", rownames(post_sum))
+param_labels <- gsub("bsp_BPSysAve_", "", param_labels)
+param_labels <- gsub("sigma_BPSysAve", "sigma", param_labels)
+
+results_df <- data.frame(
+  Parameter = param_labels,
+  Mean = sprintf("%.3f", post_sum[, "Estimate"]),
+  `95% CrI` = sprintf("(%.3f, %.3f)", post_sum[, "Q2.5"], post_sum[, "Q97.5"]),
+  check.names = FALSE
+)
+
+kable(results_df, escape = FALSE,
+      col.names = c("Parameter", "Posterior Mean", "95% CrI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2:3, width = "10em")
+```
+
+### Interpretation
+
+```{r interpret}
+# Find the TotChol parameter (may be named differently)
+tc_par <- key_pars[grepl("miTotChol|TotChol", key_pars)][1]
+tc_mean <- post_sum[tc_par, "Estimate"]
+tc_sd   <- post_sum[tc_par, "Est.Error"]
+tc_sd_obs <- sd(nhanes_dat$TotChol, na.rm = TRUE)
+
+cat(sprintf("Key finding: Each 1 mmol/L increase in total cholesterol is associated
+with a %.2f mmHg increase in systolic blood pressure (95%% CrI: %.2f to %.2f).
+
+This effect excludes zero by %.1f posterior standard deviations.
+
+Per 1 SD of TotChol (%.2f mmol/L): SBP increases by %.2f mmHg.\n",
+    tc_mean,
+    post_sum[tc_par, "Q2.5"],
+    post_sum[tc_par, "Q97.5"],
+    tc_mean / tc_sd,
+    tc_sd_obs,
+    tc_mean * tc_sd_obs))
+```
+
+---
+
+## Posterior Predictive Checks
+
+Does the model adequately capture the distribution of blood pressure?
+
+```{r ppc-density, fig.cap="Posterior predictive check: model predictions (light blue) vs. observed data (dark blue)."}
+pp_check(fit_mar, resp = "BPSysAve", type = "dens_overlay", ndraws = 50) +
+  ggtitle("Posterior Predictive Check: Density Overlay") +
+  theme_minimal()
+```
+
+The model recovers the bulk of the distribution well. There's slight underdispersion in the upper tail, which is common with linear models for health outcomes that have a long right tail.
+
+```{r ppc-grouped, fig.height=4, fig.cap="Posterior predictive check by age quartile. The dark line (observed mean) should fall within the bulk of the histogram (posterior predictive means)."}
+y_obs     <- nhanes_dat$BPSysAve
+y_rep_mat <- posterior_predict(fit_mar, resp = "BPSysAve", ndraws = 200)
+
+ppc_stat_grouped(
+  y     = y_obs,
+  yrep  = y_rep_mat,
+  group = nhanes_dat$age_quartile,
+  stat  = "mean"
+) + ggtitle("PPC: Mean SBP by Age Quartile") +
+  theme_minimal()
+```
+
+In each panel, the light blue histogram shows the distribution of mean BP from posterior predictive draws, while the dark vertical line marks the observed mean. Ideally, the observed mean falls near the center of the histogram.
+
+With the **quadratic age term** included in our model, the observed means should fall closer to the center of the posterior predictive distributions. The quadratic term allows the model to capture the non-linear relationship between age and blood pressure—BP tends to rise more steeply at older ages.
+
+---
+
+# Sensitivity Analysis: Is Our Conclusion Robust?
+
+The key question: **Does the positive association between cholesterol and blood pressure hold under different missingness assumptions?**
+
+We compare three approaches:
+
+1. **Complete Case (MCAR):** Drop observations with missing TotChol
+2. **Data Augmentation (MAR):** The model we just fit
+3. **MNAR Tilt:** Assume missing TotChol values are systematically higher than MAR predicts
+
+## Complete Case Analysis (MCAR)
+
+This implicitly assumes that missingness is completely random—observations with missing TotChol are a random sample of all observations.
+
+```{r fit-cc, results='hide', cache=TRUE}
+nhanes_cc <- drop_na(nhanes_dat, TotChol)
+cat(sprintf("Complete cases: %d of %d (%.1f%% retained)\n",
+            nrow(nhanes_cc), nrow(nhanes_dat),
+            100 * nrow(nhanes_cc) / nrow(nhanes_dat)))
+
+fit_cc <- brm(
+  formula = BPSysAve ~ Age_z + Age_zsq + BMI_z + TotChol,
+  data    = nhanes_cc,
+  prior   = c(
+    prior(normal(120, 10), class = "Intercept"),
+    prior(normal(5, 3),    class = "b", coef = "Age_z"),
+    prior(normal(0, 2),    class = "b", coef = "Age_zsq"),
+    prior(normal(3, 2),    class = "b", coef = "BMI_z"),
+    prior(normal(1, 1),    class = "b", coef = "TotChol"),
+    prior(normal(15, 5),   class = "sigma")
+  ),
+  chains = 4, iter = 2000, seed = 5440, refresh = 0,
+  control = list(adapt_delta = 0.95)
+)
+```
+
+---
+
+## MNAR Tilt: Delta-Adjustment
+
+Under MNAR, we hypothesize that missing TotChol values are systematically different from what the MAR model predicts. One common approach is the **delta-adjustment** or **tilt**:
+
+$$\text{TotChol}_{\text{imputed}}^{\text{MNAR}} = \text{TotChol}_{\text{imputed}}^{\text{MAR}} + \delta$$
+
+**Rationale for $\delta = +0.5$ mmol/L:** Participants not in the fasting subsample may have eaten recently, leading to elevated post-prandial cholesterol. We posit that, conditional on observed covariates, missing TotChol values are 0.5 mmol/L (~0.5 SD, ~20 mg/dL) higher than the MAR model predicts.
+
+```{r mnar-tilt, results='hide', cache=TRUE}
+delta <- 0.5  # mmol/L
+
+# Extract posterior mean imputations from MAR model
+draws_mar <- as_draws_df(fit_mar)
+ymi_cols  <- grep("^Ymi_TotChol", names(draws_mar), value = TRUE)
+tc_imputed_mar  <- colMeans(draws_mar[, ymi_cols])
+tc_imputed_mnar <- tc_imputed_mar + delta
+
+# Create dataset with MNAR-tilted imputations
+nhanes_mnar <- nhanes_dat
+miss_idx    <- which(is.na(nhanes_mnar$TotChol))
+nhanes_mnar$TotChol[miss_idx] <- tc_imputed_mnar
+
+# Fit model on MNAR-adjusted data
+fit_mnar <- brm(
+  formula = BPSysAve ~ Age_z + Age_zsq + BMI_z + TotChol,
+  data    = nhanes_mnar,
+  prior   = c(
+    prior(normal(120, 10), class = "Intercept"),
+    prior(normal(5, 3),    class = "b", coef = "Age_z"),
+    prior(normal(0, 2),    class = "b", coef = "Age_zsq"),
+    prior(normal(3, 2),    class = "b", coef = "BMI_z"),
+    prior(normal(1, 1),    class = "b", coef = "TotChol"),
+    prior(normal(15, 5),   class = "sigma")
+  ),
+  chains = 4, iter = 2000, seed = 5440, refresh = 0,
+  control = list(adapt_delta = 0.95)
+)
+```
+
+---
+
+## Sensitivity Results
+
+```{r sensitivity-table}
+# Helper function to extract TotChol coefficient
+get_tc_row <- function(fit, coef_name) {
+  s <- posterior_summary(fit, variable = coef_name)
+  c(mean = unname(s[1, "Estimate"]),
+    lo   = unname(s[1, "Q2.5"]),
+    hi   = unname(s[1, "Q97.5"]))
+}
+
+cc_row   <- get_tc_row(fit_cc,   "b_TotChol")
+mar_row  <- get_tc_row(fit_mar,  "bsp_BPSysAve_miTotChol")
+mnar_row <- get_tc_row(fit_mnar, "b_TotChol")
+
+sens_df <- data.frame(
+  Model = c("Complete Case (MCAR)", "Data Augmentation (MAR)",
+            sprintf("MNAR tilt (+%.1f mmol/L)", delta)),
+  Mean = sprintf("%.2f", c(cc_row["mean"], mar_row["mean"], mnar_row["mean"])),
+  `95% CrI` = c(
+    sprintf("(%.2f, %.2f)", cc_row["lo"], cc_row["hi"]),
+    sprintf("(%.2f, %.2f)", mar_row["lo"], mar_row["hi"]),
+    sprintf("(%.2f, %.2f)", mnar_row["lo"], mnar_row["hi"])
+  ),
+  check.names = FALSE
+)
+
+kable(sens_df, escape = FALSE,
+      col.names = c("Missingness Model", "β_TotChol (mean)", "95% CrI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "14em") %>%
+  column_spec(2:3, width = "8em")
+```
+
+### Interpretation
+
+The positive association between cholesterol and blood pressure **holds under all three assumptions**:
+
+- All 95% credible intervals exclude zero
+- The MNAR tilt shifts the point estimate by ~0.1 mmHg/(mmol/L), about half a posterior SD
+- The conclusion is **robust** to MNAR departures of this magnitude
+
+---
+
+## Visualizing Sensitivity
+
+### Posterior Distributions of β_TotChol
+
+```{r beta-sensitivity-plot, fig.height=5, fig.cap="Posterior distributions of β_TotChol under different missingness assumptions."}
+df_beta <- rbind(
+  data.frame(Model = "Complete Case (MCAR)",
+             beta  = as.numeric(as_draws_matrix(fit_cc, variable = "b_TotChol"))),
+  data.frame(Model = "Data Augmentation (MAR)",
+             beta  = as.numeric(as_draws_matrix(fit_mar, variable = "bsp_BPSysAve_miTotChol"))),
+  data.frame(Model = sprintf("MNAR tilt (+%.1f mmol/L)", delta),
+             beta  = as.numeric(as_draws_matrix(fit_mnar, variable = "b_TotChol")))
+)
+
+ggplot(df_beta, aes(x = beta, colour = Model, fill = Model)) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray40") +
+  scale_color_manual(values = c("#E69F00", "#0072B2", "#009E73")) +
+  scale_fill_manual(values = c("#E69F00", "#0072B2", "#009E73")) +
+  labs(x = expression(beta[TotChol] ~ "(mmHg per mmol/L)"),
+       y = "Posterior density",
+       title = expression("Sensitivity of " * beta[TotChol] * " to Missingness Assumption")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The three posteriors largely overlap, with the MNAR tilt shifting slightly to the right. All three distributions are clearly separated from zero.
+
+### Posterior Predictive Comparison
+
+Do the different models produce different predictions for blood pressure?
+
+```{r ppc-sensitivity, fig.height=5, fig.cap="Posterior predictive densities are nearly indistinguishable across models."}
+yrep_cc   <- posterior_predict(fit_cc,                      ndraws = 100)
+yrep_mar  <- posterior_predict(fit_mar,  resp = "BPSysAve", ndraws = 100)
+yrep_mnar <- posterior_predict(fit_mnar,                    ndraws = 100)
+
+df_rep <- rbind(
+  data.frame(Model = "Complete Case (MCAR)",    y = as.numeric(yrep_cc)),
+  data.frame(Model = "Data Augmentation (MAR)", y = as.numeric(yrep_mar)),
+  data.frame(Model = sprintf("MNAR tilt (+%.1f mmol/L)", delta), y = as.numeric(yrep_mnar))
+)
+df_obs <- data.frame(y = nhanes_dat$BPSysAve)
+
+ggplot() +
+  geom_density(data = df_rep, aes(x = y, colour = Model, fill = Model),
+               alpha = 0.15, linewidth = 0.8) +
+  geom_density(data = df_obs, aes(x = y),
+               colour = "black", linewidth = 1.2) +
+  scale_color_manual(values = c("#E69F00", "#0072B2", "#009E73")) +
+  scale_fill_manual(values = c("#E69F00", "#0072B2", "#009E73")) +
+  labs(x = "Average Systolic BP (mmHg)",
+       y = "Density",
+       title = "Posterior Predictive Density Across Missingness Models",
+       subtitle = "Black: observed data") +
+  coord_cartesian(xlim = c(70, 220)) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The marginal predictive densities are nearly identical across all three models. This confirms that the sensitivity analysis is about the **interpretation of the effect**, not about overall model fit.
+
+---
+
+# Key Takeaways
+
+## When to Worry About MNAR
+
+Consider MNAR sensitivity analysis when:
+
+1. **The outcome or key predictor is missing** (not just a covariate)
+2. **There's a plausible mechanism** linking the value to missingness
+3. **The missing rate is non-trivial** (>5-10%)
+4. **The scientific question is high-stakes**
+
+## How to Conduct Sensitivity Analysis
+
+```{r sa-steps, echo=FALSE}
+steps_df <- data.frame(
+  Step = c("1", "2", "3", "4"),
+  Action = c(
+    "Fit under MAR (baseline)",
+    "Identify plausible MNAR mechanisms",
+    "Fit under MNAR with range of δ values",
+    "Report if conclusion is robust across range"
+  )
+)
+
+kable(steps_df, col.names = c("Step", "Action")) %>%
+  kable_styling(bootstrap_options = c("striped", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "4em") %>%
+  column_spec(2, width = "28em")
+```
+
+## Summary Table
+
+```{r summary-table-final, echo=FALSE}
+summary_df <- data.frame(
+  Approach = c("**Complete Case**", "**Multiple Imputation**", "**Data Augmentation**", "**MNAR Sensitivity**"),
+  Assumption = c("MCAR", "MAR", "MAR", "MNAR (specified)"),
+  Strength = c(
+    "Simple, no model for missingness",
+    "Flexible, handles multiple variables",
+    "Joint posterior, single coherent model",
+    "Explicitly tests robustness"
+  ),
+  Limitation = c(
+    "Discards data, biased if not MCAR",
+    "Separate imputation and analysis steps",
+    "More complex to implement",
+    "Requires specifying untestable mechanism"
+  )
+)
+
+kable(summary_df, escape = FALSE,
+      col.names = c("Approach", "Assumption", "Strength", "Limitation")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE, position = "center") %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2, width = "6em") %>%
+  column_spec(3:4, width = "14em")
+```
+
+> **Bottom line:** MNAR cannot be tested from data. The responsible approach is to fit under multiple plausible assumptions and report whether scientific conclusions are robust. In this NHANES example, the positive cholesterol-blood pressure association holds across MCAR, MAR, and MNAR assumptions—our conclusion is robust.
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
